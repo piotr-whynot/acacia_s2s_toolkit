@@ -14,6 +14,20 @@ def cleanup_idx_files(filename_prefix):
         if path.is_file():
             path.unlink()
 
+def refine_combined_array(combined,leveltype):
+    if leveltype == 'pressure':
+        if 'isobaricInhPa' in combined.dims:
+            combined = combined.rename({'isobaricInhPa':'level'})
+        # Only transpose dims that actually exist
+        combined = combined.transpose(
+            *[d for d in ['time','member','level','latitude','longitude'] if d in combined.dims]
+        )
+    else:
+        combined = combined.transpose(
+            *[d for d in ['time','member','latitude','longitude'] if d in combined.dims]
+        )
+    return combined
+
 def merge_all_ens_members(filename,leveltype):
     # open all ensemble members. drop step and time variables. Just use valid time.
     all_fcs = xr.open_mfdataset(f'{filename}_allens_*',engine='cfgrib',combine='nested',concat_dim='fc_init_member') # open mfdataset but have fc_init_member as a dimension
@@ -52,40 +66,19 @@ def merge_all_ens_members(filename,leveltype):
     except:
         pass
 
-    if leveltype == 'pressure':
-        if 'isobaricInhPa' in combined.dims:
-            combined = combined.rename({'isobaricInhPa':'level'})
-        # Only transpose dims that actually exist
-        combined = combined.transpose(
-            *[d for d in ['time','member','level','latitude','longitude'] if d in combined.dims]
-        )
-    else:
-        combined = combined.transpose(
-            *[d for d in ['time','member','latitude','longitude'] if d in combined.dims]
-        )
+    refine_combined_array(combined,leveltype)
 
     return combined
 
 def merge_all_ens_hindcasts(filename,leveltype):
-    all_fcs = xr.open_mfdataset(f'{filename}_allens_*',combine='nested',concat_dim='fc_init_member') # open mfdataset but have fc_init_member as a dimension, i.e. number of forecast initialisations used.
+    all_fcs = xr.open_mfdataset(f'{filename}_allens_*',combine='nested',concat_dim='lag') # open mfdataset but have fc_init_member as a dimension, i.e. number of forecast initialisations used.
 
-    if "fc_init_member" not in all_fcs.dims:
-        all_fcs = all_fcs.expand_dims("fc_init_member") # expand a fc_init_member if only one file is download. it will have a dimension of 1. 
+    if "lag" not in all_fcs.dims:
+        all_fcs = all_fcs.expand_dims("lag") # expand a fc_init_member if only one file is download. it will have a dimension of 1. 
 
-    combined = all_fcs.stack(member=("fc_init_member", "number")).reset_index("member", drop=True)
+    combined = all_fcs.stack(member=("lag", "number"))
 
-    if leveltype == 'pressure':
-        if 'isobaricInhPa' in combined.dims:
-            combined = combined.rename({'isobaricInhPa':'level'})
-        # Only transpose dims that actually exist
-        combined = combined.transpose(
-            *[d for d in ['time','member','level','latitude','longitude'] if d in combined.dims]
-        )
-    else:
-        print (combined)
-        combined = combined.transpose(
-            *[d for d in ['time','member','latitude','longitude'] if d in combined.dims]
-        )
+    combined = refine_combined_array(combined,leveltype)
 
     return combined
 

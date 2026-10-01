@@ -12,6 +12,9 @@ import subprocess
 import cdsapi
 import glob
 from pathlib import Path
+import acacia_s2s_toolkit
+import json
+import pandas as pd
 
 def get_ecds_client():
     os.environ["CDSAPI_RC"] = os.path.expanduser("~/.cdsapirc.ecds")
@@ -23,6 +26,58 @@ def cleanup_patterns(*patterns):
             path = Path(path_str)
             if path.is_file():
                 path.unlink()
+
+def accumulate_single_fc(fc,start_lt):
+    start_times = fc.time.isel(time=slice(0, -1))
+    fc = fc.diff(dim='time')
+    fc = fc.assign_coords(time=start_times)
+    # First interval is only needed to establish the accumulation
+    # at start_lt, so remove it from the output.
+    if start_lt > 0:
+        fc = fc.isel(time=slice(1, None))
+    return fc
+
+def average_single_fc(fc,period):
+    # if not accumulated, work out average field, like weekly averages.
+    n_days = int(period[:-1])  # e.g. 7 for '7D'
+    # trim to complete periods
+    n_complete = (fc.sizes['time'] // n_days) * n_days
+    # Save start times before aggregation
+    start_times = fc.time.isel(time=slice(0, n_complete, n_days))
+    fc = (fc.isel(time=slice(0, n_complete)).coarsen(time=n_days, boundary='trim').mean())
+    # Force time coordinate to start of averaging period
+    fc = fc.assign_coords(time=start_times)
+    return fc
+
+def aggregation_process(forecast,variable,start_lt,period,hindcast=False):
+    # addition to deaccumulate accumulation field or average instantaneous or daily fields.
+    # if accumulation field, take a difference
+    # Convention:
+    # time coordinate always represents the START of the period
+    # represented by each value.
+    time_resolution = argument_output.get_timeresolution(variable)
+    if not hindcast:
+        if 'accumulated' in time_resolution:
+            forecast = accumulate_single_fc(forecast,start_lt)
+        else:
+            forecast = average_single_fc(forecast,period)
+    else:
+        processed_hindcasts = []
+        for lag, hc_set in forecast.groupby('lag'):
+            if 'member' in hc_set.fc_init.dims: # add to handle one-lag reforecasts
+                hc_set = hc_set.assign_coords(fc_init=("time", hc_set.fc_init.isel(member=0).values))
+            for fc_init, hc_run in hc_set.compute().groupby('fc_init'):
+                if 'accumulated' in time_resolution:
+                    hc_run_processed = accumulate_single_fc(hc_run,start_lt)
+                else:
+                    hc_run_processed = average_single_fc(hc_run,period)
+                processed_hindcasts.append(hc_run_processed)
+        forecast = xr.concat(processed_hindcasts,dim='time').sortby('time')
+        if isinstance(forecast.indexes["member"], pd.MultiIndex):
+            forecast = (forecast.reset_index("member", drop=True)
+                           .assign_coords(member=np.arange(forecast.sizes["member"])))
+
+    return forecast
 
 def create_initial_ecdsAPI_request(fcdate,grid,area,origin,webapi_param,leadtimes):
     request_dict = {
@@ -45,15 +100,16 @@ def create_initial_ecdsAPI_request(fcdate,grid,area,origin,webapi_param,leadtime
 
     return request_dict
 
-def request_forecast(fcdate,origin,grid,variable,area,data_format,webapi_param,leadtime_hour,leveltype,filename,plevs,fc_enslags):
+def request_forecast(fcdate,origin,grid,variable,area,data_format,webapi_param,leadtime_hour,period,leveltype,filename,plevs,fc_enslags,start_lt,aggregation_switch,cleanup=True):
     # import registration detailis
     client = get_ecds_client()
     dataset = "s2s-forecasts"
     # to enable lagged ensemble, loop through requested ensembles
     for lag in np.atleast_1d(fc_enslags):
         lag = int(lag)
-        leadtimes, convert_fcdate = argument_output.output_formatted_leadtimes(leadtime_hour,fcdate,variable,origin,lag=lag,fc_enslags=fc_enslags) # you need to know new fcdate, but also appropriate leadtimes so all are forecasting same period
+        leadtimes, convert_fcdate = argument_output.output_formatted_leadtimes(leadtime_hour,fcdate,variable,origin,period=period,lag=lag,fc_enslags=fc_enslags) # you need to know new fcdate, but also appropriate leadtimes so all are forecasting same period
         # create initial control request
+        print (f'leadtimes going in {leadtimes} at lag {lag}')
         request_dict = create_initial_ecdsAPI_request(convert_fcdate,grid,area,origin,webapi_param,leadtimes)
 
         # change components of request based on level type, and grid
@@ -88,27 +144,84 @@ def request_forecast(fcdate,origin,grid,variable,area,data_format,webapi_param,l
         # set forecast type in control to pf (perturbed forecast).
         set_cf_to_pf(f'{filename}_control_{lag}',f'{filename}_control2_{lag}')
        
+        # get variable resolution
+        time_resolution = argument_output.get_timeresolution(variable)
+
+        if origin == 'rjtd' and leadtimes.startswith('0') and ('accumulated' in time_resolution):
+            print ('need to add zero time')
+            add_zero_time(f'{filename}_control2_{lag}',f'{filename}_controlZEROADDED_{lag}')
+            add_zero_time(f'{filename}_perturbed_{lag}',f'{filename}_perturbedZEROADDED_{lag}')
+            control_fn = f'{filename}_controlZEROADDED_{lag}'
+            pert_fn = f'{filename}_perturbedZEROADDED_{lag}'
+        else:
+            control_fn = f'{filename}_control2_{lag}'
+            pert_fn = f'{filename}_perturbed_{lag}'
+
         # merge both control and perturbed forecast
-        cmd = ["cdo","-O","merge",f"{filename}_control2_{lag}",f"{filename}_perturbed_{lag}",f"{filename}_allens_{lag}",]
+        cmd = ["cdo","-O","merge",control_fn,pert_fn,f"{filename}_allens_{lag}",]
         result = subprocess.run(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True)
         if result.returncode != 0:
             print(result.stderr)
             raise subprocess.CalledProcessError(result.returncode, cmd, stderr=result.stderr)
-
+    
     # create new 'member' dimension based on same date. For instance, 5 members per date and three initialisations used
     # smae process following even with one forecast initialisation date to ensure same structure for all output. 
     combined_forecast = merge_lag_ensemble.merge_all_ens_members(f'{filename}',leveltype)
+    
+    # addition to deaccumulate accumulation field or average instantaneous or daily fields
+    if aggregation_switch:
+        time_resolution = argument_output.get_timeresolution(variable)
+        # if daily averaged field, shift time back one day
+        if time_resolution == 'averaged_24hrs':
+            combined_forecast = combined_forecast.assign_coords(time=combined_forecast.time - np.timedelta64(24, 'h'))
+        combined_forecast= aggregation_process(combined_forecast,variable,start_lt,period)
+        time_label='time label denotes start of period'
+    else:
+        time_label='no change made to variable timing'
+
+    metadata = {
+            'Conventions': 'CF-1.8',
+                    'title': f'{origin} Sub-seasonal Forecast',
+                    'institution': 'ECMWF',
+                    'source': 'Downloaded via acacia_s2s_toolkit',
+                    'history': 'Downloaded via acacia_s2s_toolkit',
+                    'toolkit': 'acacia_s2s_toolkit',
+                    'toolkit_version': acacia_s2s_toolkit.__version__,
+                    'forecast_initialisation_date': str(fcdate),
+                    'origin': origin,
+                    'grid': grid,
+                    'variable': variable,
+                    'leadtime_hour': ','.join(map(str, np.atleast_1d(leadtime_hour))),
+                    'period': period,
+                    'leveltype': leveltype,
+                    'timelabel': time_label,
+                    'pressure_levels': (
+                        '' if plevs is None
+                        else ','.join(map(str, np.atleast_1d(plevs)))
+                    ),
+                    'lag_ensemble_days': ','.join(
+                        map(str, np.atleast_1d(fc_enslags))
+                    ),
+                    'aggregation_applied': str(aggregation_switch),
+                    'data_format': data_format,
+            }
+
+    combined_forecast.attrs.update(metadata)
+    
+    for var in combined_forecast.data_vars:
+        combined_forecast[var].attrs.update(metadata)
+
     combined_forecast.to_netcdf(f'{filename}.nc')
 
-    # remove previous files  
-    cleanup_patterns(f"{filename}_control*",f"{filename}_perturbed*",f"{filename}_allens*",)  
+    # remove previous files
+    if cleanup:
+        cleanup_patterns(f"{filename}_control*",f"{filename}_perturbed*",f"{filename}_allens*",)  
 
-def request_hindcast(fcdate,origin,grid,variable,area,data_format,webapi_param,leadtime_hour,leveltype,filename,plevs,rf_enslags,rf_years,fc_time=True):
+def request_hindcast(fcdate,origin,grid,variable,area,data_format,webapi_param,leadtime_hour,period,leveltype,filename,plevs,rf_enslags,rf_years,start_lt,aggregation_switch,fc_time=True,cleanup=True):
     # to enable lagged ensemble, loop through requested ensembles
     # import registration details
     client = get_ecds_client()
-    dataset = "s2s-reforecasts" 
-  
+    dataset = "s2s-reforecasts"  
     print (rf_enslags)
     for lag in np.atleast_1d(rf_enslags):
         lag = int(lag)
@@ -118,7 +231,8 @@ def request_hindcast(fcdate,origin,grid,variable,area,data_format,webapi_param,l
 
         rf_model_date, rfyears = argument_output.check_and_output_all_hc_arguments(variable,origin,convert_fcdate,rf_years) # get the reforecast model date version plus the number of reforecast years
 
-        leadtimes, lag_fcdate_dashed_format = argument_output.output_formatted_leadtimes(leadtime_hour,convert_fcdate,variable,origin) # get the appropriate leadtimes plus the convert fcdate.
+        leadtimes, lag_fcdate_dashed_format = argument_output.output_formatted_leadtimes(leadtime_hour,convert_fcdate,variable,origin,period=period) # get the appropriate leadtimes plus the convert fcdate. For reforecast, the lag is set to zero as forecast date has already changed, additionally fc_enslags=0 as you always want full series (i.e. no trimming).
+
         print (leadtimes)
 
         # create initial control request
@@ -165,10 +279,23 @@ def request_hindcast(fcdate,origin,grid,variable,area,data_format,webapi_param,l
         # once requesting control and perturbed forecast, combine the two.
         # set forecast type in control to pf (perturbed forecast).
         set_cf_to_pf(f'{filename}_control_{lag}',f'{filename}_control2_{lag}')
+        
+        # get variable resolution
+        time_resolution = argument_output.get_timeresolution(variable)
+
+        if origin == 'rjtd' and leadtimes.startswith('0') and ('accumulated' in time_resolution):
+            print ('need to add zero time')
+            add_zero_time(f'{filename}_control2_{lag}',f'{filename}_controlZEROADDED_{lag}')
+            add_zero_time(f'{filename}_perturbed_{lag}',f'{filename}_perturbedZEROADDED_{lag}')
+            control_fn = f'{filename}_controlZEROADDED_{lag}'
+            pert_fn = f'{filename}_perturbedZEROADDED_{lag}'
+        else:
+            control_fn = f'{filename}_control2_{lag}'
+            pert_fn = f'{filename}_perturbed_{lag}'
 
         # Merge control and perturbed forecast members into one file.
         # We suppress routine CDO warning noise, but still raise on real failures.
-        cmd = ["cdo","-O","merge",f"{filename}_control2_{lag}",f"{filename}_perturbed_{lag}",f"{filename}_allens_{lag}",]
+        cmd = ["cdo","-O","merge",control_fn,pert_fn,f"{filename}_allens_{lag}",]
         result = subprocess.run(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True)
         if result.returncode != 0:
             print(result.stderr)
@@ -180,36 +307,83 @@ def request_hindcast(fcdate,origin,grid,variable,area,data_format,webapi_param,l
         else:
             shift_day_value = 0 
         # only shift the time, if you want a 'forecast-based' time.
-        rf_shifttime(f'{filename}_allens_{lag}',f'{filename}_timeshifted_allens_{lag}',shift_days=shift_day_value)
+        rf_shifttime(f'{filename}_allens_{lag}',f'{filename}_timeshifted_allens_{lag}',lag,shift_days=shift_day_value)
 
     # create new 'member' dimension based on same date. For instance, 5 members per date and three initialisations used
     # same process following even with one forecast initialisation date to ensure same structure for all output. 
     combined_forecast = merge_lag_ensemble.merge_all_ens_hindcasts(f'{filename}_timeshifted',leveltype)
+
+    # addition to deaccumulate accumulation field or average instantaneous or daily fields
+    if aggregation_switch:
+        time_resolution = argument_output.get_timeresolution(variable)
+        # if daily averaged field, shift time back one day
+        if time_resolution == 'averaged_24hrs':
+            combined_forecast = combined_forecast.assign_coords(time=combined_forecast.time - np.timedelta64(24, 'h'))
+        combined_forecast= aggregation_process(combined_forecast,variable,start_lt,period,hindcast=True)
+        time_label='time label denotes start of period'
+    else:
+        time_label='no change made to variable timing'
+    
+    # before saving, put in request attributes
+    metadata = {'Conventions': 'CF-1.8',
+                    'title': f'{origin} Sub-seasonal Reforecast',
+                    'institution': 'ECMWF',
+                    'source': 'Downloaded via acacia_s2s_toolkit',
+                    'history': 'Downloaded via acacia_s2s_toolkit',
+                    'toolkit': 'acacia_s2s_toolkit',
+                    'toolkit_version': acacia_s2s_toolkit.__version__,
+                    'forecast_initialisation_date': str(fcdate),
+                    'origin': origin,
+                    'grid': grid,
+                    'variable': variable,
+                    'leadtime_hour': ','.join(map(str, np.atleast_1d(leadtime_hour))),
+                    'period': period,
+                    'leveltype': leveltype,
+                    'timelabel': time_label,
+                    'lag_ensemble_days': ','.join(map(str, np.atleast_1d(rf_enslags))),
+                    'reforecast_years': ','.join(map(str, np.atleast_1d(rf_years))),
+                    'fctime': str(fc_time),
+                    'pressure_levels': (
+                        '' if plevs is None
+                        else ','.join(map(str, np.atleast_1d(plevs)))
+                    ),
+                    'lag_ensemble_days': ','.join(
+                        map(str, np.atleast_1d(rf_enslags))
+                    ),
+                    'aggregation_applied': str(aggregation_switch),
+                    'data_format': data_format,}
+    
+    combined_forecast.attrs.update(metadata)
+
+    for var in combined_forecast.data_vars:
+        combined_forecast[var].attrs.update(metadata)
+    
     combined_forecast.to_netcdf(f'{filename}.nc')
 
     # remove previous files  
-    cleanup_patterns(f"{filename}_control*",f"{filename}_perturbed*",f"{filename}_allens*",)
+    if cleanup:
+        cleanup_patterns(f"{filename}_control*",f"{filename}_perturbed*",f"{filename}_allens*",f'{filename}_timeshifted')
 
-def rf_shifttime(fn,output_fn,shift_days=0):
-    orig_hc = xr.open_dataset(fn,engine='cfgrib')
-    if np.size(orig_hc['step'].values) > 1: # different option depending on size of step variable.
-        data = [] # loop through each time point (forecast initialisation). only save the valid forecast time.
-        for time_pt in orig_hc['time']:
-            select = orig_hc.sel(time=time_pt)
-            select = select.assign_coords(step=select['valid_time'])
-            select = select.drop_vars(["valid_time","time"])
-            select = select.rename({'step':'valid_time'})
-            data.append(select)
-        orig_hc_new = xr.concat(data, dim='valid_time')
-        #orig_hc_new = xr.merge(data)
+def rf_shifttime(fn, output_fn, lag, shift_days=0):
+    '''
+    Shift time so it is aligned with fc_init_date. Additionally, keep forecast date information
+    '''
+    orig_hc = xr.open_dataset(fn, engine='cfgrib')
+    if np.size(orig_hc['step'].values) > 1:
+        fc_init = np.repeat(orig_hc.time.values,len(orig_hc.step))
+
+        orig_hc_new = (orig_hc.stack(valid_time=("time", "step")).drop_vars(["time", "step"]).assign_coords(
+                valid_time=orig_hc.valid_time.values.ravel(),fc_init=("valid_time", fc_init),))
     else:
-        orig_hc_new = orig_hc.swap_dims({'time':'valid_time'})
+        orig_hc_new = orig_hc.swap_dims({'time': 'valid_time'})
         orig_hc_new = orig_hc_new.drop_vars("time")
 
-    orig_hc_new = orig_hc_new.assign_coords(
-            valid_time=orig_hc_new.valid_time+np.timedelta64(shift_days,'D')
-            )
-    orig_hc_new = orig_hc_new.rename({'valid_time':'time'})
+        orig_hc_new = orig_hc_new.assign_coords(fc_init=("valid_time", orig_hc.time.values))
+
+    orig_hc_new = orig_hc_new.assign_coords(valid_time=orig_hc_new.valid_time + np.timedelta64(shift_days, 'D'))
+
+    orig_hc_new = orig_hc_new.rename({'valid_time': 'time'})
+    orig_hc_new = orig_hc_new.assign_coords(lag=lag)
     orig_hc_new.to_netcdf(output_fn)
 
 def set_cf_to_pf(input_file, output_file):
@@ -223,3 +397,45 @@ def set_cf_to_pf(input_file, output_file):
             ec.codes_set(gid, 'type', 'pf')
             ec.codes_write(gid,fout)
             ec.codes_release(gid)
+
+def add_zero_time(input_file, output_file):
+    first_messages = []
+    with open(input_file, 'rb') as fin:
+        first_endstep = None
+        while True:
+            gid = ec.codes_grib_new_from_file(fin)
+            if gid is None:
+                break
+            endstep = ec.codes_get(gid, 'endStep')
+
+            if first_endstep is None:
+                first_endstep = endstep
+
+            if endstep == first_endstep:
+                first_messages.append(ec.codes_clone(gid))
+
+            ec.codes_release(gid)
+
+    with open(output_file, 'wb') as fout:
+        # Write synthetic 0-0 fields first
+        for gid in first_messages:
+            values = ec.codes_get_values(gid)
+            values[:] = 0.0
+            ec.codes_set_values(gid, values)
+
+            ec.codes_set(gid, 'startStep', 0)
+            ec.codes_set(gid, 'endStep', 0)
+
+            ec.codes_write(gid, fout)
+            ec.codes_release(gid)
+
+        # Now append original file
+        with open(input_file, 'rb') as fin:
+            while True:
+                gid = ec.codes_grib_new_from_file(fin)
+                if gid is None:
+                    break
+                ec.codes_write(gid, fout)
+                ec.codes_release(gid)
+
+
