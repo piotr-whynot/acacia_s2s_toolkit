@@ -1,8 +1,10 @@
 #
+dev/
+readme_dev.txt
 install_as_local_package.sh
 example_notebooks/data
 src/acacia_s2s_toolkit/.webAPI_requests.py
-
+*dev.ipynb
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
