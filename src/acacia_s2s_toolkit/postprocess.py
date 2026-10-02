@@ -14,7 +14,21 @@ import pooch
 autodoc_mock_imports = ["esmpy", "xesmf", "netCDF4"]
 
 #this determines with functions will be publicly visible in the installed package
-__all__=["postprocess_forecast","get_example_data","load_raw_data"]
+__all__=["postprocess_forecast",
+         "get_example_data",
+         "load_raw_data", 
+         "read_netcdf", 
+         "add_enslag",
+         "deaccumulate",
+         "align_grid",
+         "set_verbose",
+         "align_time",
+         "organize_by_leadtime",
+         "_log",
+         "aggregate",
+         "leadtime_to_time",
+         "organize_by_validtime"
+        ]
 
 #######################################################################################
 
@@ -28,7 +42,7 @@ VERBOSE = True
 def set_verbose(v):
     global VERBOSE
     VERBOSE = v
-    print("logging is {}".format(v))
+    print("verbosity is {}".format(v))
 
 
 def _log(msg, force=False):
@@ -294,8 +308,12 @@ def deaccumulate(accum):
     # Calculate day-to-day differences
     _log("Computing day-to-day differences...")
     daily = midnight.diff("time")
-    
-    daily=daily.where(daily>=0,0)
+
+    #to get rid of negative values
+    dailypositveonly=daily.where(daily>=0,0)
+
+    #but have to bring nans back
+    daily=dailypositveonly.where(~np.isnan(daily))
     
     #have to add the first day back
     daily = daily.reindex(time=midnight.time, fill_value=np.nan)
@@ -327,81 +345,6 @@ def deaccumulate(accum):
 
 
 
-
-
-
-def accumulated_to_daily(accum):
-    """
-    Convert accumulated values (e.g. precipitation) to daily totals.
-
-    Midnight (00:00) accumulation values are differenced to obtain daily
-    totals. Because the value at 00:00 represents accumulation over the
-    *previous* day, the first value is reinserted and timestamps are
-    shifted back by one day so that each value corresponds to the correct
-    accumulation period.
-
-    For hindcasts, the first day of each hindcast cycle is removed from 
-    daily totals series to avoid artificial negative differences that 
-    arise when differencing across hindcast boundaries.
-
-    Parameters
-    ----------
-    accum : xarray.DataArray or xarray.Dataset
-        Accumulated values with a ``time`` coordinate.
-
-    Returns
-    -------
-    xarray.DataArray or xarray.Dataset
-        Daily totals with timestamps representing the day of accumulation.
-    """
-
-    _log("\n" + "="*60)
-    _log(" START: accumulated_to_daily ".center(60, "="))
-    _log("="*60 + "\n")
-
-    # Select midnight values (00:00) in case data are sub=daily, would it work for staggered initializations?
-    _log("Selecting midnight accumulation values...")
-    
-    midnight = accum.sel(time=accum.time.dt.hour == 0)
-    
-    # Calculate day-to-day differences
-    _log("Computing day-to-day differences...")
-    # we use this instead of diff(). With diff() if data has N time steps, there is only N-1 time steps after diff().
-    # to go back do N - we would need to concatenate the first time step to the output
-    # this one just leaves the original date in, and fills it with NaN, so there is still N time steps in the array
-    daily = midnight - midnight.shift(time=1)
-    
-    _log("Detecting cycle starts...")
-    
-    # this catches first days of each cycle. It's important if only one initialization time, i.e. a non-staggered hindcast. 
-    # In daily data for staggered hindasts these days will be NaNs anyway.
-    # using diff here
-    time_gap = midnight.time.diff("time") > np.timedelta64(1, "D")
-    #because adding back the lost first time step is easy since we fill the first day with True
-    time_gap = time_gap.reindex(time=midnight.time, fill_value=True)
-    
-    #this catches all nans in staggered hindcasts, so also first day nans 
-    nan_gap = midnight.shift(time=1).isnull()
-
-    #merging detected nans
-    all_gaps = time_gap | nan_gap
-    
-    _log("Replacing missing differences...")
-    #in staggered hindcast - first days of each cycle will be replaced by original accumulated value, other nans will be replaced by nans
-    #in non staggered hindcasts - the first days of the cycle will be replaced by original accumulated value
-    daily = daily.where(~all_gaps, midnight)
-
-    # Shift timestamps back by one day - this is done so that a value for a particular date represents the total over that date. The time stamp
-    # is kept to be at 00:00, but this is no longer the previous day accumulation.
-    _log("Shifting timestamps to represent accumulation day...")
-    daily["time"] = daily.indexes["time"] - pd.DateOffset(days=1)
-
-    daily=daily.transpose("time","member","lat","lon")
-    _log("all done")
-    _log("\n" + "="*60+"\n")
-
-    return daily
-    
 
 
 def align_grid(finegrid, coarsegrid, direction="fine_to_coarse", method="conservative", raise_if_missing=True, threshold=0.9):
@@ -495,7 +438,7 @@ def align_grid(finegrid, coarsegrid, direction="fine_to_coarse", method="conserv
 
 
 
-def align_time(obs, hindcast, raise_if_missing=True):
+def align_time(obs, hindcast, add_members=False, raise_if_missing=True):
     """
     Align two datasets in time by selecting timestamps from the coarse grid dataset.
 
@@ -557,25 +500,28 @@ def align_time(obs, hindcast, raise_if_missing=True):
             ))
     else:
         _log("Time coverage verified: obs fully covers hindcast period.")
-    #construct pseudo-members in obs data corresponding to hindcast members
-    pseudo_members=[]
-    for m in hindcastaligned.member.values:
-        member_data = hindcastaligned.sel(member=m)
 
-        # valid timestep if any gridcell is non-nan
-        valid = ~np.isnan(member_data).all(("lat", "lon"))    
-        #select obs values for valid data
-        pseudo_member=obsaligned.sel(time=valid)
-        pseudo_member=pseudo_member.expand_dims(dim={"member":[m]})
-        pseudo_members.append(pseudo_member)
-
-    obsaligned = xr.concat(
-        pseudo_members,
-        dim="member",
-        join="outer",
-        coords=["enslag"]
-    )
-    obsaligned=obsaligned.transpose("time","member","lat","lon")
+    if add_members:
+        #construct pseudo-members in obs data corresponding to hindcast members
+        pseudo_members=[]
+        for m in hindcastaligned.member.values:
+            member_data = hindcastaligned.sel(member=m)
+    
+            # valid timestep if any gridcell is non-nan
+            valid = ~np.isnan(member_data).all(("lat", "lon"))    
+            #select obs values for valid data
+            pseudo_member=obsaligned.sel(time=valid)
+            pseudo_member=pseudo_member.expand_dims(dim={"member":[m]})
+            pseudo_members.append(pseudo_member)
+    
+        obsaligned = xr.concat(
+            pseudo_members,
+            dim="member",
+            join="outer",
+            coords=["enslag"]
+        )
+        obsaligned=obsaligned.transpose("time","member","lat","lon")
+        
     
     _log("\n" + "="*60+"\n")
 
@@ -595,7 +541,7 @@ def leadtime_to_time(data, drop_member=False):
     nominal_time=data["nominal_time"]
     lead_time=data["lead_time"]
     
-    enslag_by_member = data["enslag"].isel(nominal_time=0)
+    enslag_by_member = data.isel(nominal_time=0)["enslag"]
      
     _log("combining members with nominal_time")
     
@@ -675,7 +621,7 @@ def organize_by_validtime(data, trim=True, drop_member=False):
     
         blocks.append(block)
         
-    combined=xr.concat(blocks, "valid_time").transpose("valid_time","member","lead_time","lat","lon")
+    combined=xr.concat(blocks, "valid_time").transpose("valid_time","lead_time","member","lat","lon")
     if drop_member:
         combined=combined.isel(member=0).drop_vars("member").transpose("valid_time","lead_time","lat","lon")
 
@@ -685,7 +631,7 @@ def organize_by_validtime(data, trim=True, drop_member=False):
 
 
 
-def organize_by_leadtime(data,nominal_time=None):
+def organize_by_leadtime(data,nominal_time=None,is_observed=False):
     """
     Reshape data into (nominal_time, member, lead_time, lat, lon),
     supporting multiple initializations inside a single file.
@@ -1318,3 +1264,54 @@ def aggregate(
     
     return aggdata
 
+
+#this is temporary function
+def add_enslag(data, nominal_date):
+    isinit_time=(data.time.diff("time") > np.timedelta64(1, "D")).reindex(time=data.time, fill_value=True)
+    
+    if nominal_date is None:
+        # Assign time to each cycle - that is the time of the earliest initialization
+        nominal_dates = data.time[isinit_time].data
+    else:
+        nominal_date=pd.to_datetime(nominal_date)
+        
+        nominal_dates = data.time[isinit_time].data
+        nominal_dates = [pd.to_datetime(d).replace(month=nominal_date.month, day=nominal_date.day) for d in nominal_dates]
+        
+    #iterate through members
+    enslags=[]
+    ensdates=[]
+    for m in data.member.values:
+        member_data = data.sel(member=m)
+        #initialization days when valid data start after a stagger gap
+        # this cannot be inferred from time, as it might be different for each member
+        # valid timesteps when any gridcell is non-nan
+        valid = ~np.isnan(member_data).all(("lat", "lon"))
+        
+        #this is first valid day after the gap
+        isinit_gap = valid & ~valid.shift(time=1, fill_value=False)
+        
+        #this will be index of the last valid
+        isend_gap=valid & ~valid.shift(time=-1, fill_value=False)
+    
+        # now for non-staggered hindcasts, there are no gaps, so we need to use time-based init
+        if isinit_gap.sum()>1:
+            isinit=isinit_gap
+            isend=isend_gap
+        else:
+            isinit=isinit_time
+            isend=~isinit_time & isinit_time.shift(time=-1, fill_value=True)
+        
+        #indices of member's initialization days
+        init_indices = np.where(isinit)[0]
+        
+        #indices of member's last days
+        end_indices = np.where(isend)[0]
+        
+        enslag=int((data.time.data[init_indices[0]]-nominal_dates[0])/np.timedelta64(1, 'D'))
+    
+        enslags.append(enslag)
+        ensdates.append(data.time.data[init_indices[0]])
+    
+    data=data.assign_coords(enslag=("member",enslags))
+    return data

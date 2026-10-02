@@ -15,7 +15,7 @@ import pooch
 autodoc_mock_imports = []
 
 #this determines with functions will be publicly visible in the installed package
-__all__=["biascorrection_qqmapping", "biascorrection_meanvariance"]
+__all__=["biascorrection"]
 
 
 #######################################################################################
@@ -117,6 +117,7 @@ def biascorrection_meanvariance(forecast,hindcast,observed):
 
 from scipy.stats import gaussian_kde
 
+#helper function for kde distribution fitting
 def _kde_cdf_grid(sample, n_grid=2000, pad_factor=3):
     """Return (grid, cdf) for a smoothed CDF via KDE."""
     kde = gaussian_kde(sample)  # Scott's rule bandwidth by default
@@ -141,7 +142,25 @@ def register_bc(name):
     return wrapper
 
 
-@register_bc("kde")
+
+
+@register_bc("scaling")
+def simple_scaling(hc_1d, ob_1d, x_1d):
+
+    #simple correction of mean and variance
+    
+    #calculating variance, or actually standard deviation
+    hcsd=hc_1d.std(ddof=0)
+    
+    #calculating variance adjustment
+    std_correction=ob_1d.std(ddof=0)/hcsd
+    
+    #adjusting target
+    fcadj=((x_1d-hc_1d.mean())*std_correction)+x_1d.mean()
+    
+    return fcadj
+
+@register_bc("qm-kde")
 def qm_core_kde(hc_1d, ob_1d, x_1d, n_grid=2000):
     hc_1d = hc_1d[~np.isnan(hc_1d)]
     ob_1d = ob_1d[~np.isnan(ob_1d)]
@@ -162,8 +181,8 @@ def qm_core_kde(hc_1d, ob_1d, x_1d, n_grid=2000):
     return result
     
     
-@register_bc("simple")
-def qm_core(hc_1d, ob_1d, x_1d):
+@register_bc("qm-ecdf")
+def qm_core_ecdf(hc_1d, ob_1d, x_1d):
 
     # remove NaNs
     hc_1d = hc_1d[~np.isnan(hc_1d)]
@@ -185,7 +204,7 @@ def qm_core(hc_1d, ob_1d, x_1d):
 from scipy.stats import gamma
 
 
-@register_bc("gamma")
+@register_bc("qm-gamma")
 def qm_core_gamma(hc_1d, ob_1d, x_1d):
     hc_1d = hc_1d[~np.isnan(hc_1d)]
     ob_1d = ob_1d[~np.isnan(ob_1d)]
@@ -226,8 +245,10 @@ def qm_core_gamma(hc_1d, ob_1d, x_1d):
         result[pos_mask] = gamma.ppf(p_rescaled, ob_shape, loc=ob_loc, scale=ob_scale)
 
     return result
+
+
     
-def biascorrection_qqmapping(forecast,hindcast,observed,window_size=7, is_aggregated=False, method="simple"):
+def biascorrection(forecast,hindcast, observed, window_size=7, is_aggregated=False, method="qm-ecdf"):
     """
     Apply quantile-quantile mapping bias correction to forecast and hindcast data.
     
@@ -317,7 +338,8 @@ def biascorrection_qqmapping(forecast,hindcast,observed,window_size=7, is_aggreg
     observed_adjusted=observed.copy().transpose("lead_time", "lat", "lon", timevar, "member")
     
     #getting some parameters for processing
-    lead_time = forecast_adjusted.lead_time.data
+    lead_time = (set(forecast_adjusted.lead_time.data) & set(hindcast_adjusted.lead_time.data))
+    lead_time=np.array(list(lead_time))
     
     #splitting into windows
     window_idx = lead_time // window_size
@@ -329,21 +351,27 @@ def biascorrection_qqmapping(forecast,hindcast,observed,window_size=7, is_aggreg
     n_full = (len(lead_time) // window_size) * window_size
     
     if n_full<len(lead_time):
-        _log(f"Requested window size: {window_size}, data has {len(lead_time)} lead times. Trimming data to a multiple of window size, i.e. {n_full} lead times.")
+        _log(f"Requested window size: {window_size}, data has {len(lead_time)} lead times. the last two windows will be processed as one")
+        window_idx[window_idx == window_idx.max()] = np.partition(window_idx, -2)[-2]
+
     
     #trimming to full window
-    forecast_trimmed = forecast_adjusted.isel(lead_time=slice(0, n_full))
-    hindcast_trimmed = hindcast_adjusted.isel(lead_time=slice(0, n_full))
-    observed_trimmed = observed.isel(lead_time=slice(0, n_full))
+    n_lt=len(window_idx)
+    
+    forecast_trimmed = forecast_adjusted.isel(lead_time=slice(0, n_lt))
+    hindcast_trimmed = hindcast_adjusted.isel(lead_time=slice(0, n_lt))
+    observed_trimmed = observed.isel(lead_time=slice(0, n_lt))
     
     #trimming to full windows
-    window_idx=window_idx[0:n_full]
-    lead_time=lead_time[0:n_full]
+    #window_idx=window_idx[0:n_full]
+    lead_time=lead_time[0:n_lt]
+    
     n_windows=max(window_idx)
     
     #iterating through lead times
     for w in np.unique(window_idx):
         mask=window_idx==w
+        
         hc=hindcast_trimmed.isel(lead_time=mask)
         fc=forecast_trimmed.isel(lead_time=mask)
         ob=observed_trimmed.isel(lead_time=mask)
